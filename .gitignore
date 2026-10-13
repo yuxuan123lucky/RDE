@@ -1,0 +1,61 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model weights and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+checkpoints/
+checkpoint/
+
+# Training and evaluation output
+run_logs/
+logs/
+runs/
+tb_logs/
+events.out.tfevents.*
+*.log
+train_log.txt
+test_log.txt
+
+# Original datasets; keep the source package in 2024-CVPR-RDE/datasets/
+/datasets/
+CUHK-PEDES/
+ICFG-PEDES/
+RSTPReid/
+
+# Temporary downloads and large archives
+downloads/
+*.download
+*.part
+*.crdownload
+*.tmp
+*.temp
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.xz
+*.7z
+*.rar
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+.aws/
+.ssh/
+.secrets/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
