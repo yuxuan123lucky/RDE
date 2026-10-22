@@ -17,6 +17,7 @@ checkpoint/
 run_logs/
 logs/
 runs/
+/outputs/
 tb_logs/
 events.out.tfevents.*
 *.log
