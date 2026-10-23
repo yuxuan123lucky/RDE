@@ -7,10 +7,22 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from retrieval_diagnostics import build_query_metadata, classify_query
+from retrieval_diagnostics import (build_query_metadata, classify_query,
+                                   select_split, summarize_outcomes)
 
 
 class MetadataTests(unittest.TestCase):
+    def test_val_selection_never_falls_back_to_test(self):
+        val = {"image_pids": [1], "caption_pids": [1]}
+        test = {"image_pids": [2], "caption_pids": [2]}
+        dataset = SimpleNamespace(val_annos=[{"id": 1}], val=val,
+                                  test_annos=[{"id": 2}], test=test)
+        self.assertEqual(select_split(dataset, "val"), (dataset.val_annos, val))
+        self.assertEqual(select_split(dataset, "test"), (dataset.test_annos, test))
+        dataset.val_annos = []
+        with self.assertRaisesRegex(ValueError, "val split has no"):
+            select_split(dataset, "val")
+
     def test_multiple_captions_and_same_identity_images(self):
         annos = [
             {"id": 7, "file_path": "a.jpg", "captions": ["red coat", "black shoes"]},
@@ -36,6 +48,19 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(classify_query(False, True, True), "fusion_preserves_single_success")
         self.assertEqual(classify_query(False, False, False), "all_wrong")
 
+    def test_all_top1_outcomes_and_fusion_losses(self):
+        from itertools import product
+
+        branch_outcomes, complementarity = summarize_outcomes(product((False, True), repeat=3))
+        self.assertEqual(branch_outcomes, {
+            "both_correct": 2, "only_bge_correct": 2,
+            "only_tse_correct": 2, "both_wrong": 2})
+        self.assertEqual(complementarity["bge_correct_fusion_wrong"], 2)
+        self.assertEqual(complementarity["tse_correct_fusion_wrong"], 2)
+        self.assertEqual(complementarity["fusion_corrects_both"], 1)
+        self.assertEqual(complementarity["fusion_corrects_at_least_one"], 3)
+        self.assertEqual(complementarity["fusion_introduces_error"], 3)
+
 
 class MetricParityTests(unittest.TestCase):
     def test_chunked_metrics_match_original_rank_with_multiple_positives(self):
@@ -60,8 +85,8 @@ class MetricParityTests(unittest.TestCase):
                     "source_image_index": i, "source_image_path": f"image_{i}.jpg"}
                    for i, pid in enumerate(qids)]
         paths = [f"image_{i}.jpg" for i in range(len(gids))]
-        summary, rows, _ = compute_diagnostics(q_bge, g_bge, q_tse, g_tse,
-                                                 qids, gids, paths, queries, 10, 1)
+        summary, rows, comparisons = compute_diagnostics(q_bge, g_bge, q_tse, g_tse,
+                                                           qids, gids, paths, queries, 10, 1)
         sb = F.normalize(q_bge, dim=1) @ F.normalize(g_bge, dim=1).t()
         st = F.normalize(q_tse, dim=1) @ F.normalize(g_tse, dim=1).t()
         for name, scores in (("BGE", sb), ("TSE", st), ("BGE+TSE", (sb + st) / 2)):
@@ -73,6 +98,13 @@ class MetricParityTests(unittest.TestCase):
         for row in rows:
             self.assertTrue(all(item["is_positive"] == (item["pid"] == row["pid"])
                                 for item in json.loads(row["fused_topk"])))
+        self.assertEqual(sum(summary["branch_outcomes"].values()), len(qids))
+        self.assertEqual(summary["complementarity"]["bge_correct_fusion_wrong"],
+                         sum(row["bge_correct"] and not row["fused_correct"]
+                             for row in comparisons))
+        self.assertEqual(summary["complementarity"]["tse_correct_fusion_wrong"],
+                         sum(row["tse_correct"] and not row["fused_correct"]
+                             for row in comparisons))
 
 
 if __name__ == "__main__":

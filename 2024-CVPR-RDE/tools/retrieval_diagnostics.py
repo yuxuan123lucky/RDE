@@ -25,6 +25,8 @@ DATASET_CLASSES = {
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset_name", required=True, choices=DATASET_CLASSES)
+    parser.add_argument("--split", choices=("val", "test"), default="test",
+                        help="evaluation split; default: test for backward compatibility")
     parser.add_argument("--root_dir", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output_dir", required=True, type=Path)
@@ -32,7 +34,7 @@ def parse_args(argv=None):
                         help="defaults to configs.yaml beside the checkpoint")
     parser.add_argument("--topk", type=int, default=10)
     parser.add_argument("--max_queries", type=int,
-                        help="analyze the first N test captions; gallery stays complete")
+                        help="analyze the first N captions of the selected split; gallery stays complete")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--score_chunk_size", type=int, default=64)
     parser.add_argument("--num_visualizations", type=int, default=24)
@@ -49,8 +51,8 @@ def parse_args(argv=None):
             parser.error(f"{label} does not exist or is not a {kind}: {path}")
     if args.output_dir.exists():
         parser.error(f"output directory already exists; refusing to overwrite: {args.output_dir}")
-    if args.output_dir == args.checkpoint.parent or args.checkpoint.parent in args.output_dir.parents:
-        parser.error("output directory must be outside the checkpoint run directory")
+    if args.output_dir == args.checkpoint.parent:
+        parser.error("output directory cannot be the checkpoint directory")
     if args.output_dir == args.root_dir or args.root_dir in args.output_dir.parents:
         parser.error("output directory must be outside the dataset root")
     if args.topk < 1 or args.score_chunk_size < 1:
@@ -62,31 +64,42 @@ def parse_args(argv=None):
     return args
 
 
-def build_query_metadata(test_annos, img_dataset, txt_dataset, img_dir, image_key):
+def select_split(dataset, split):
+    """Select matching annotations and processed gallery/queries without a fallback."""
+    if split not in ("val", "test"):
+        raise ValueError(f"unsupported diagnostic split: {split}")
+    annos = getattr(dataset, f"{split}_annos")
+    data = getattr(dataset, split)
+    if not annos or not data["image_pids"] or not data["caption_pids"]:
+        raise ValueError(f"{split} split has no annotations, gallery images, or text queries")
+    return annos, data
+
+
+def build_query_metadata(annos, img_dataset, txt_dataset, img_dir, image_key):
     """Recover the original caption/image link and verify the loader's order."""
     queries = []
     image_index = 0
-    for anno in test_annos:
+    for anno in annos:
         pid = int(anno["id"])
         image_path = os.path.normpath(os.path.join(img_dir, anno[image_key]))
         if image_index >= len(img_dataset.img_paths):
-            raise ValueError("annotation has more test images than the image loader")
+            raise ValueError("annotation has more images than the image loader")
         if (pid != int(img_dataset.image_pids[image_index]) or
                 image_path != os.path.normpath(img_dataset.img_paths[image_index])):
-            raise ValueError(f"test image order/PID differs at index {image_index}")
+            raise ValueError(f"image order/PID differs at index {image_index}")
         for caption in anno["captions"]:
             query_index = len(queries)
             if query_index >= len(txt_dataset.captions):
-                raise ValueError("annotation has more test captions than the text loader")
+                raise ValueError("annotation has more captions than the text loader")
             if (caption != txt_dataset.captions[query_index] or
                     pid != int(txt_dataset.caption_pids[query_index])):
-                raise ValueError(f"test caption order/PID differs at index {query_index}")
+                raise ValueError(f"caption order/PID differs at index {query_index}")
             queries.append({"query_index": query_index, "text": caption,
                             "pid": pid, "source_image_index": image_index,
                             "source_image_path": image_path})
         image_index += 1
     if image_index != len(img_dataset.img_paths) or len(queries) != len(txt_dataset.captions):
-        raise ValueError("annotation and test loader lengths differ")
+        raise ValueError("annotation and loader lengths differ")
     return queries
 
 
@@ -98,6 +111,33 @@ def classify_query(bge_correct, tse_correct, fused_correct):
     if bge_correct and tse_correct:
         return "all_correct"
     return "all_wrong"
+
+
+def summarize_outcomes(outcomes):
+    """Count branch agreement and effects of fixed fusion from Top-1 booleans."""
+    counts = Counter()
+    for bge_ok, tse_ok, fused_ok in outcomes:
+        counts["both_correct" if bge_ok and tse_ok else
+               "only_bge_correct" if bge_ok else
+               "only_tse_correct" if tse_ok else "both_wrong"] += 1
+        counts["bge_correct_fusion_wrong"] += bool(bge_ok and not fused_ok)
+        counts["tse_correct_fusion_wrong"] += bool(tse_ok and not fused_ok)
+        counts["fusion_corrects_both"] += bool(fused_ok and not (bge_ok or tse_ok))
+        counts["fusion_corrects_at_least_one"] += bool(fused_ok and not (bge_ok and tse_ok))
+        counts["fusion_introduces_error"] += bool(not fused_ok and (bge_ok or tse_ok))
+        counts[f"category_{classify_query(bge_ok, tse_ok, fused_ok)}"] += 1
+    branch_outcomes = {key: counts[key] for key in
+                       ("both_correct", "only_bge_correct", "only_tse_correct", "both_wrong")}
+    complementarity = {key: counts[key] for key in
+                       ("bge_correct_fusion_wrong", "tse_correct_fusion_wrong",
+                        "fusion_corrects_both", "fusion_corrects_at_least_one",
+                        "fusion_introduces_error")}
+    complementarity["bge_correct_tse_wrong"] = branch_outcomes["only_bge_correct"]
+    complementarity["tse_correct_bge_wrong"] = branch_outcomes["only_tse_correct"]
+    complementarity["categories"] = {
+        key[len("category_"):]: value for key, value in counts.items()
+        if key.startswith("category_")}
+    return branch_outcomes, complementarity
 
 
 def score_query(scores, sorted_indices, query_pid, gallery_pids, gallery_paths, topk):
@@ -148,7 +188,7 @@ def compute_diagnostics(q_bge, g_bge, q_tse, g_tse, qids, gids,
         raise ValueError("gallery must contain at least max(10, --topk) images")
     gallery_pid_set = set(int(pid) for pid in gids)
     if any(int(pid) not in gallery_pid_set for pid in qids):
-        raise ValueError("one or more test queries have no positive gallery image")
+        raise ValueError("one or more queries have no positive gallery image")
 
     q_bge = F.normalize(q_bge, p=2, dim=1)
     g_bge = F.normalize(g_bge, p=2, dim=1)
@@ -198,6 +238,8 @@ def compute_diagnostics(q_bge, g_bge, q_tse, g_tse, qids, gids,
                 "bge_correct": bge_ok, "tse_correct": tse_ok, "fused_correct": fused_ok,
                 "bge_correct_tse_wrong": bge_ok and not tse_ok,
                 "tse_correct_bge_wrong": tse_ok and not bge_ok,
+                "bge_correct_fusion_wrong": bge_ok and not fused_ok,
+                "tse_correct_fusion_wrong": tse_ok and not fused_ok,
                 "fusion_corrects_both": fused_ok and not (bge_ok or tse_ok),
                 "fusion_corrects_at_least_one": fused_ok and not (bge_ok and tse_ok),
                 "fusion_introduces_error": not fused_ok and (bge_ok or tse_ok),
@@ -210,10 +252,12 @@ def compute_diagnostics(q_bge, g_bge, q_tse, g_tse, qids, gids,
     n = len(qids)
     metrics = {branch: dict(zip(("R1", "R5", "R10", "mAP", "mINP"),
                                 (metric_sums[branch] / n).tolist())) for branch in BRANCHES}
-    category_counts = Counter(row["category"] for row in comparison_rows)
+    branch_outcomes, complementarity = summarize_outcomes(
+        (row["bge_correct"], row["tse_correct"], row["fused_correct"])
+        for row in comparison_rows)
     summary = {
         "dataset": None,
-        "split": "test",
+        "split": None,
         "num_queries": n,
         "num_gallery_images": len(gids),
         "partial_queries": False,
@@ -221,14 +265,8 @@ def compute_diagnostics(q_bge, g_bge, q_tse, g_tse, qids, gids,
         "top1_errors": {branch: sum(not row[{"BGE": "bge", "TSE": "tse",
                                                 "BGE+TSE": "fused"}[branch] + "_top1_correct"]
                                     for row in query_rows) for branch in BRANCHES},
-        "complementarity": {
-            "bge_correct_tse_wrong": sum(row["bge_correct_tse_wrong"] for row in comparison_rows),
-            "tse_correct_bge_wrong": sum(row["tse_correct_bge_wrong"] for row in comparison_rows),
-            "fusion_corrects_both": sum(row["fusion_corrects_both"] for row in comparison_rows),
-            "fusion_corrects_at_least_one": sum(row["fusion_corrects_at_least_one"] for row in comparison_rows),
-            "fusion_introduces_error": sum(row["fusion_introduces_error"] for row in comparison_rows),
-            "categories": dict(category_counts),
-        },
+        "branch_outcomes": branch_outcomes,
+        "complementarity": complementarity,
         "metric_note": "Original utils.metrics.rank; PID equality defines every positive image."
     }
     return summary, query_rows, comparison_rows
@@ -326,6 +364,8 @@ def run(args):
 
     sys.path.insert(0, str(PROJECT_ROOT))
     from datasets import build_dataloader
+    from datasets.bases import ImageDataset, TextDataset
+    from datasets.build import build_transforms
     from model import build_model
     from utils.checkpoint import Checkpointer
     from utils.iotools import load_train_configs
@@ -344,20 +384,34 @@ def run(args):
                          f"not {args.dataset_name}")
     config.root_dir = str(args.root_dir)
     config.training = False
-    img_loader, txt_loader, num_classes = build_dataloader(config)
+    module_name, class_name, image_key = DATASET_CLASSES[args.dataset_name]
+    dataset_module = __import__(f"datasets.{module_name}", fromlist=[class_name])
+    dataset = getattr(dataset_module, class_name)(root=str(args.root_dir), verbose=False)
+    annos, split_data = select_split(dataset, args.split)
+    if args.split == "test":
+        img_loader, txt_loader, num_classes = build_dataloader(config)
+    else:
+        # Test mode in build_dataloader always selects test; construct the same
+        # inference datasets/transforms for val without changing baseline code.
+        transforms = build_transforms(img_size=config.img_size, is_train=False)
+        img_loader = DataLoader(
+            ImageDataset(split_data["image_pids"], split_data["img_paths"], transforms),
+            batch_size=config.test_batch_size, shuffle=False, num_workers=config.num_workers)
+        txt_loader = DataLoader(
+            TextDataset(split_data["caption_pids"], split_data["captions"],
+                        text_length=config.text_length),
+            batch_size=config.test_batch_size, shuffle=False, num_workers=config.num_workers)
+        num_classes = len(dataset.train_id_container)
     full_query_count = len(txt_loader.dataset)
     query_count = min(args.max_queries or full_query_count, full_query_count)
     if query_count == 0:
-        raise ValueError("test split contains no text queries")
+        raise ValueError(f"{args.split} split contains no text queries")
     if query_count < full_query_count:
         txt_loader = DataLoader(Subset(txt_loader.dataset, range(query_count)),
                                 batch_size=txt_loader.batch_size, shuffle=False,
                                 num_workers=txt_loader.num_workers)
 
-    module_name, class_name, image_key = DATASET_CLASSES[args.dataset_name]
-    dataset_module = __import__(f"datasets.{module_name}", fromlist=[class_name])
-    dataset = getattr(dataset_module, class_name)(root=str(args.root_dir), verbose=False)
-    queries = build_query_metadata(dataset.test_annos, img_loader.dataset,
+    queries = build_query_metadata(annos, img_loader.dataset,
                                    txt_loader.dataset.dataset if isinstance(txt_loader.dataset, Subset)
                                    else txt_loader.dataset,
                                    dataset.img_dir, image_key)[:query_count]
@@ -375,12 +429,15 @@ def run(args):
         q_bge, g_bge, q_tse, g_tse, qids, gids,
         img_loader.dataset.img_paths, queries, args.topk, args.score_chunk_size)
     summary["dataset"] = args.dataset_name
+    summary["split"] = args.split
     summary["partial_queries"] = query_count < full_query_count
-    summary["full_test_query_count"] = full_query_count
+    summary["full_split_query_count"] = full_query_count
     summary["saved_val_dataset"] = getattr(config, "val_dataset", None)
-    summary["test_py_metric_comparison"] = "pending external test.py output comparison"
+    summary["test_py_metric_comparison"] = (
+        "pending external test.py output comparison" if args.split == "test"
+        else "not applicable: test.py evaluates only the test split")
     if summary["partial_queries"]:
-        summary["metric_note"] += " Partial-query metrics are not comparable with full test.py metrics."
+        summary["metric_note"] += " Partial-query metrics are not comparable with full-split metrics."
 
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT,
                             capture_output=True, text=True, check=True).stdout.strip()
@@ -388,7 +445,7 @@ def run(args):
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "git_commit": commit,
         "dataset": args.dataset_name,
-        "split": "test",
+        "split": args.split,
         "saved_val_dataset": getattr(config, "val_dataset", None),
         "checkpoint": str(args.checkpoint),
         "checkpoint_size_bytes": args.checkpoint.stat().st_size,
@@ -401,7 +458,7 @@ def run(args):
         "topk": args.topk,
         "max_queries": args.max_queries,
         "analyzed_queries": query_count,
-        "full_test_queries": full_query_count,
+        "full_split_queries": full_query_count,
         "score_chunk_size": args.score_chunk_size,
         "num_visualizations_requested": args.num_visualizations,
     }
