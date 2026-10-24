@@ -36,6 +36,8 @@ def parse_args(argv=None):
     parser.add_argument("--max_queries", type=int,
                         help="analyze the first N captions of the selected split; gallery stays complete")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--seed", type=int, default=1,
+                        help="random seed; default: 1 for the original single-GPU run")
     parser.add_argument("--score_chunk_size", type=int, default=64)
     parser.add_argument("--num_visualizations", type=int, default=24)
     args = parser.parse_args(argv)
@@ -62,6 +64,21 @@ def parse_args(argv=None):
     if args.num_visualizations < 0:
         parser.error("--num_visualizations cannot be negative")
     return args
+
+
+def set_seed(seed):
+    """Match train.py:set_seed for single-GPU diagnostic inference."""
+    import random
+    import numpy as np
+    import torch
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
 
 
 def select_split(dataset, split):
@@ -360,6 +377,8 @@ def render_examples(output_dir, rows, limit):
 
 def run(args):
     import torch
+
+    set_seed(args.seed)
     from torch.utils.data import DataLoader, Subset
 
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -455,6 +474,9 @@ def run(args):
         "root_dir": str(args.root_dir),
         "output_dir": str(args.output_dir),
         "device": str(device),
+        "seed": args.seed,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
         "topk": args.topk,
         "max_queries": args.max_queries,
         "analyzed_queries": query_count,

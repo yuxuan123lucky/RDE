@@ -1,14 +1,65 @@
 """Small, data-free checks for the retrieval diagnostic tool."""
 
+import ast
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from retrieval_diagnostics import (build_query_metadata, classify_query,
-                                   select_split, summarize_outcomes)
+from retrieval_diagnostics import (build_query_metadata, classify_query, parse_args,
+                                   select_split, set_seed, summarize_outcomes)
+
+
+class SeedTests(unittest.TestCase):
+    def test_seed_initialization_matches_train_order(self):
+        calls = []
+        cudnn = SimpleNamespace(deterministic=False, benchmark=False)
+        fake_torch = SimpleNamespace(
+            manual_seed=lambda value: calls.append(("torch", value)),
+            cuda=SimpleNamespace(
+                manual_seed=lambda value: calls.append(("cuda", value)),
+                manual_seed_all=lambda value: calls.append(("cuda_all", value))),
+            backends=SimpleNamespace(cudnn=cudnn))
+        fake_numpy = SimpleNamespace(random=SimpleNamespace(
+            seed=lambda value: calls.append(("numpy", value))))
+        with patch.dict(sys.modules, {"torch": fake_torch, "numpy": fake_numpy}):
+            with patch("random.seed", side_effect=lambda value: calls.append(("random", value))):
+                set_seed(7)
+        self.assertEqual(calls, [(name, 7) for name in
+                                 ("torch", "cuda", "cuda_all", "numpy", "random")])
+        self.assertTrue(cudnn.deterministic)
+        self.assertTrue(cudnn.benchmark)
+
+    def test_cli_default_and_override_seed(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            base = Path(scratch)
+            root = base / "datasets"
+            run = base / "checkpoint_run"
+            root.mkdir()
+            run.mkdir()
+            checkpoint = run / "best.pth"
+            checkpoint.touch()
+            (run / "configs.yaml").touch()
+            arguments = ["--dataset_name", "RSTPReid", "--root_dir", str(root),
+                         "--checkpoint", str(checkpoint), "--output_dir", str(base / "diagnostics")]
+            self.assertEqual(parse_args(arguments).seed, 1)
+            self.assertEqual(parse_args(arguments + ["--seed", "7"]).seed, 7)
+
+    def test_seed_call_precedes_model_and_feature_extraction(self):
+        source = Path(__file__).with_name("retrieval_diagnostics.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        run = next(node for node in module.body
+                   if isinstance(node, ast.FunctionDef) and node.name == "run")
+        calls = {node.func.id if isinstance(node.func, ast.Name) else node.func.attr: node.lineno
+                 for node in ast.walk(run) if isinstance(node, ast.Call)
+                 and isinstance(node.func, (ast.Name, ast.Attribute))}
+        self.assertLess(calls["set_seed"], calls["build_dataloader"])
+        self.assertLess(calls["set_seed"], calls["build_model"])
+        self.assertLess(calls["set_seed"], calls["_compute_embedding"])
 
 
 class MetadataTests(unittest.TestCase):

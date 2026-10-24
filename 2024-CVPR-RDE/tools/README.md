@@ -21,6 +21,7 @@ python tools/retrieval_diagnostics.py \
   --root_dir /root/siton-data-gaominData/ZYX/datasets \
   --checkpoint "$CKPT" \
   --output_dir /root/siton-data-gaominData/ZYX/RDE/outputs/CUHK-PEDES/diagnostics/val_${RUN} \
+  --seed 1 \
   --device cuda:0
 ```
 
@@ -33,6 +34,7 @@ python tools/retrieval_diagnostics.py \
   --root_dir /root/siton-data-gaominData/ZYX/datasets \
   --checkpoint "$CKPT" \
   --output_dir /root/siton-data-gaominData/ZYX/RDE/outputs/ICFG-PEDES/diagnostics/test_${RUN} \
+  --seed 1 \
   --device cuda:0
 ```
 
@@ -45,8 +47,15 @@ python tools/retrieval_diagnostics.py \
   --root_dir /root/siton-data-gaominData/ZYX/datasets \
   --checkpoint "$CKPT" \
   --output_dir /root/siton-data-gaominData/ZYX/RDE/outputs/RSTPReid/diagnostics/val_${RUN} \
+  --seed 1 \
   --device cuda:0
 ```
+
+`--seed` defaults to 1 on a single GPU. Before loading the model or extracting
+features, the script applies the same PyTorch CPU/CUDA, NumPy, Python random,
+and cuDNN initialization as `train.py:set_seed()`: `deterministic=True` and
+`benchmark=True`. `run_metadata.json` records the seed and actual cuDNN flags,
+along with dataset, split and checkpoint path.
 
 `--split` defaults to `test` for compatibility. Select `val` explicitly for
 CUHK-PEDES and RSTPReid validation diagnostics. Confirm that the chosen split
