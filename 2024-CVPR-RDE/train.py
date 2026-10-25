@@ -32,6 +32,10 @@ def set_seed(seed=0):
 
 if __name__ == '__main__':
     args = get_args()
+    if args.init_checkpoint and args.resume:
+        raise ValueError('--init_checkpoint and --resume cannot be used together')
+    if args.init_checkpoint and not os.path.isfile(args.init_checkpoint):
+        raise FileNotFoundError(f'initial checkpoint not found: {args.init_checkpoint}')
     set_seed(1+get_rank())
     name = args.name
 
@@ -46,6 +50,8 @@ if __name__ == '__main__':
     device = "cuda"
     cur_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     args.output_dir = op.join(args.output_dir, args.dataset_name, f'{cur_time}_{name}_{args.loss_names}')
+    if args.tse_enhancement != 'none' and not args.resume and os.path.exists(args.output_dir):
+        raise FileExistsError(f'experiment output directory already exists: {args.output_dir}')
     logger = setup_logger('RDE', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
     logger.info("Using {} GPUs".format(num_gpus))
     logger.info(str(args).replace(',', '\n'))
@@ -61,6 +67,8 @@ if __name__ == '__main__':
     model = build_model(args, num_classes)
     logger.info('Total params: %2.fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
     model.to(device)
+    if args.init_checkpoint:
+        Checkpointer(model).load(f=args.init_checkpoint)
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(

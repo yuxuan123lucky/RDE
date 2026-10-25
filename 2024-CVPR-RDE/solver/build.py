@@ -31,6 +31,9 @@ def build_optimizer(args, model):
             lr =  0.001
         if "texual_emb_layer" in key:
             lr =  0.001 
+        if "_tse_enhancer." in key:
+            # Train the new TSE branch at the same rate as the original TSE layers.
+            lr = 0.001
             
         params += [{"params": [value], "lr": lr, "weight_decay": weight_decay}]
 

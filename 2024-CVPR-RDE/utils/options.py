@@ -19,9 +19,18 @@ def get_args():
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
+    parser.add_argument("--init_checkpoint", default="",
+                        help="initialize model weights from an RDE checkpoint without optimizer state")
 
     ######################## model general settings ########################
     parser.add_argument("--pretrain_choice", default='ViT-B/16') # whether use pretrained model
+    parser.add_argument("--tse_enhancement", default='none',
+                        choices=('none', 'adapter', 'delta_gate'),
+                        help="optional TSE feature enhancement mode")
+    parser.add_argument("--adapter_bottleneck", type=int, default=256,
+                        help="hidden dimension of each modality's TSE adapter and gate")
+    parser.add_argument("--adapter_scale", type=float, default=0.1,
+                        help="positive scale of the TSE residual update")
     parser.add_argument("--temperature", type=float, default=0.02, help="initial temperature value, if 0, don't use temperature")
     parser.add_argument("--img_aug", default=False, action='store_true')
     parser.add_argument("--txt_aug", default=False, action='store_true')

@@ -2,6 +2,7 @@ from model import objectives
 
 from .CrossEmbeddingLayer_tse import TexualEmbeddingLayer, VisualEmbeddingLayer
 from .clip_model import build_CLIP_from_openai_pretrained, convert_weights
+from .tse_enhancement import TSEEnhancer
 import torch
 import torch.nn as nn 
 import torch.nn.functional as F
@@ -27,6 +28,19 @@ class RDE(nn.Module):
  
         self.visul_emb_layer = VisualEmbeddingLayer(ratio=args.select_ratio)
         self.texual_emb_layer = TexualEmbeddingLayer(ratio=args.select_ratio)
+
+        self.tse_enhancement = getattr(args, 'tse_enhancement', 'none')
+        if self.tse_enhancement not in ('none', 'adapter', 'delta_gate'):
+            raise ValueError(f'unsupported TSE enhancement: {self.tse_enhancement}')
+        if self.tse_enhancement != 'none':
+            bottleneck = getattr(args, 'adapter_bottleneck', 256)
+            scale = getattr(args, 'adapter_scale', 0.1)
+            self.image_tse_enhancer = TSEEnhancer(
+                self.tse_enhancement, self.embed_dim,
+                self.visul_emb_layer.embed_dim, bottleneck, scale)
+            self.text_tse_enhancer = TSEEnhancer(
+                self.tse_enhancement, self.embed_dim,
+                self.texual_emb_layer.embed_dim, bottleneck, scale)
  
         if 'TAL' in self.current_task:
             loss_type = 'TAL'
@@ -56,11 +70,16 @@ class RDE(nn.Module):
     def encode_image_tse(self, image):
         x,atten_i = self.base_model.encode_image(image)
         i_tse_f = self.visul_emb_layer(x, atten_i)   
+        if self.tse_enhancement != 'none':
+            i_tse_f = self.image_tse_enhancer(i_tse_f, x[:, 0, :])
         return i_tse_f.float()
  
     def encode_text_tse(self, text):
         x,atten_t = self.base_model.encode_text(text.long())
         t_tse_f = self.texual_emb_layer(x, text, atten_t)
+        if self.tse_enhancement != 'none':
+            t_bge = x[torch.arange(x.shape[0], device=x.device), text.argmax(dim=-1)]
+            t_tse_f = self.text_tse_enhancer(t_tse_f, t_bge)
         return t_tse_f.float()
 
     def compute_per_loss(self, batch):
@@ -73,6 +92,9 @@ class RDE(nn.Module):
 
         i_tse_f = self.visul_emb_layer(image_feats, atten_i)
         t_tse_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
+        if self.tse_enhancement != 'none':
+            i_tse_f = self.image_tse_enhancer(i_tse_f, i_feats)
+            t_tse_f = self.text_tse_enhancer(t_tse_f, t_feats)
 
         lossA, simsA = objectives.compute_per_loss(i_feats, t_feats, batch['pids'], \
                                                     tau=self.args.tau, \
@@ -100,6 +122,9 @@ class RDE(nn.Module):
 
         i_tse_f = self.visul_emb_layer(image_feats, atten_i)
         t_tse_f = self.texual_emb_layer(text_feats, caption_ids, atten_t)
+        if self.tse_enhancement != 'none':
+            i_tse_f = self.image_tse_enhancer(i_tse_f, i_feats)
+            t_tse_f = self.text_tse_enhancer(t_tse_f, t_feats)
             
         label_hat = batch['label_hat'].to(i_feats.device) 
      
@@ -116,4 +141,9 @@ def build_model(args, num_classes=11003):
     model = RDE(args, num_classes)
     # covert model to fp16
     convert_weights(model)
+    if model.tse_enhancement != 'none':
+        # The original conversion also visits new Linear layers. Restore the
+        # enhancement modules to fp32 to match RDE's float32 TSE outputs.
+        model.image_tse_enhancer.float()
+        model.text_tse_enhancer.float()
     return model
