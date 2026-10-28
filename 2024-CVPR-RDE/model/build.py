@@ -2,6 +2,7 @@ from model import objectives
 
 from .CrossEmbeddingLayer_tse import TexualEmbeddingLayer, VisualEmbeddingLayer
 from .clip_model import build_CLIP_from_openai_pretrained, convert_weights
+from .local_evidence import local_evidence_loss, validate_evidence_options
 import torch
 import torch.nn as nn 
 import torch.nn.functional as F
@@ -19,6 +20,23 @@ class RDE(nn.Module):
         self.args = args
         self.num_classes = num_classes
         self._set_task()
+
+        self.evidence_mode = getattr(args, 'evidence_mode', 'none')
+        if self.evidence_mode == 'off':
+            self.evidence_mode = 'none'
+        if self.evidence_mode not in ('none', 'a_only'):
+            raise ValueError('evidence_mode must be none/off or a_only')
+        if self.evidence_mode == 'a_only':
+            self.evidence_options = dict(
+                candidates=getattr(args, 'evidence_candidates', 4),
+                weight=getattr(args, 'evidence_weight', 0.1),
+                temperature=getattr(args, 'evidence_temperature', 0.07),
+                margin=getattr(args, 'evidence_margin', 0.1))
+            validate_evidence_options(**self.evidence_options)
+            if getattr(args, 'noisy_rate', None) != 0.0:
+                raise ValueError('mechanism A requires explicit noisy_rate=0.0')
+            if 'TAL' not in self.current_task:
+                raise ValueError('mechanism A pilot requires the original TAL task')
 
         self.base_model, base_cfg = build_CLIP_from_openai_pretrained(args.pretrain_choice, args.img_size, args.stride_size)
         self.embed_dim = base_cfg['embed_dim']
@@ -87,7 +105,7 @@ class RDE(nn.Module):
         
         return lossA.detach().cpu(), lossB.detach().cpu(), simsA, simsB
 
-    def forward(self, batch):
+    def forward(self, batch, return_evidence=False):
         ret = dict()
         ret.update({'temperature': 1 / self.logit_scale})
 
@@ -108,6 +126,19 @@ class RDE(nn.Module):
                                                 loss_type=self.loss_type,logit_scale=self.logit_scale)
         ret.update({'bge_loss':loss1})
         ret.update({'tse_loss':loss2})
+
+        if self.training and self.evidence_mode == 'a_only':
+            if torch.is_grad_enabled() and not (image_feats.requires_grad and text_feats.requires_grad):
+                raise RuntimeError('mechanism A requires gradient-preserving visual/text encoder outputs')
+            # The original projection preserves a gradient path for patches;
+            # its output dimension alone does not establish local semantic alignment.
+            evidence = local_evidence_loss(
+                image_feats[:, 1:, :], t_feats, i_feats, batch['pids'],
+                query_mask=label_hat, **self.evidence_options)
+            ret['evidence_a_loss'] = evidence['loss']
+            ret['evidence_valid_queries'] = evidence['valid_query_mask'].sum().detach()
+            if return_evidence:
+                ret['evidence_relations'] = evidence
   
         return ret
 

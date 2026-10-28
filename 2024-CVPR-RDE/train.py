@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import random
 import time
+from pathlib import Path
 
 
 from datasets import build_dataloader
@@ -13,6 +14,7 @@ from utils.iotools import save_train_configs
 from utils.logger import setup_logger
 from solver import build_optimizer, build_lr_scheduler
 from model import build_model
+from model.local_evidence import validate_evidence_options
 from utils.metrics import Evaluator
 from utils.options import get_args
 from utils.comm import get_rank, synchronize
@@ -38,6 +40,20 @@ if __name__ == '__main__':
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = num_gpus > 1
 
+    evidence_enabled = args.evidence_mode == 'a_only'
+    if evidence_enabled:
+        validate_evidence_options(args.evidence_candidates, args.evidence_weight,
+                                  args.evidence_temperature, args.evidence_margin)
+        if args.noisy_rate != 0.0 or 'TAL' not in args.loss_names.split('+'):
+            raise ValueError('A-only requires --noisy_rate 0.0 and the original TAL task')
+        if args.distributed:
+            raise ValueError('the mechanism A pilot supports one GPU')
+        outputs = (Path(__file__).resolve().parents[1] / 'outputs').resolve()
+        root = outputs if args.output_dir == 'logs' else Path(args.output_dir).expanduser().resolve()
+        if root != outputs and outputs not in root.parents:
+            raise ValueError(f'A-only outputs must be under {outputs}')
+        args.output_dir = str(root)
+
     if args.distributed:
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
@@ -45,7 +61,14 @@ if __name__ == '__main__':
     
     device = "cuda"
     cur_time = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    if evidence_enabled:
+        name = name + '_evidence_a'
     args.output_dir = op.join(args.output_dir, args.dataset_name, f'{cur_time}_{name}_{args.loss_names}')
+    if evidence_enabled:
+        # Atomically reserve a fresh run before opening logs/configs/checkpoints.
+        if outputs not in Path(args.output_dir).resolve().parents:
+            raise ValueError('A-only run path escaped the repository outputs directory')
+        os.makedirs(args.output_dir, exist_ok=False)
     logger = setup_logger('RDE', save_dir=args.output_dir, if_train=args.training, distributed_rank=get_rank())
     logger.info("Using {} GPUs".format(num_gpus))
     logger.info(str(args).replace(',', '\n'))
@@ -80,23 +103,31 @@ if __name__ == '__main__':
     start_epoch = 1
     if args.resume:
         checkpoint = checkpointer.resume(args.resume_ckpt_file)
+        if evidence_enabled:
+            expected_evidence = {key: getattr(args, key) for key in (
+                'evidence_mode', 'evidence_candidates', 'evidence_weight',
+                'evidence_temperature', 'evidence_margin')}
+            if checkpoint.get('evidence_config') != expected_evidence:
+                raise ValueError('A-only resume requires matching evidence_config metadata; '
+                                 'resume is not weight-only Baseline initialization')
         start_epoch = checkpoint['epoch']
         logger.info(f"===================>start {start_epoch}")
 
 
     do_train(start_epoch, args, model, train_loader, evaluator, optimizer, scheduler, checkpointer)
     
-    # test
-    logger.info(f"===================>start test")
-    args.training = False
-    test_img_loader, test_txt_loader, num_classes = build_dataloader(args)
-    
-    asss = ['best.pth','last.pth']
-    for i in range(len(asss)):
-        if os.path.exists(op.join(args.output_dir, asss[i])):
-            model = build_model(args,num_classes)
-            checkpointer = Checkpointer(model)
-            checkpointer.load(f=op.join(args.output_dir, asss[i]))
-            model = model.cuda()
-            do_inference(model, test_img_loader, test_txt_loader)
+    # Keep the original Test block; smoke runs can explicitly avoid Test access.
+    if not args.skip_final_test:
+        logger.info(f"===================>start test")
+        args.training = False
+        test_img_loader, test_txt_loader, num_classes = build_dataloader(args)
+
+        asss = ['best.pth','last.pth']
+        for i in range(len(asss)):
+            if os.path.exists(op.join(args.output_dir, asss[i])):
+                model = build_model(args,num_classes)
+                checkpointer = Checkpointer(model)
+                checkpointer.load(f=op.join(args.output_dir, asss[i]))
+                model = model.cuda()
+                do_inference(model, test_img_loader, test_txt_loader)
      

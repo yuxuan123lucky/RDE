@@ -17,11 +17,18 @@ def get_args():
     parser.add_argument("--log_period", default=100)
     parser.add_argument("--eval_period", default=1)
     parser.add_argument("--val_dataset", default="test") # use val set when evaluate, if test use test set
+    parser.add_argument("--skip_final_test", action='store_true',
+                        help="skip post-training Best/Last Test evaluation (use with Val for smoke tests)")
     parser.add_argument("--resume", default=False, action='store_true')
     parser.add_argument("--resume_ckpt_file", default="", help='resume from ...')
 
     ######################## model general settings ########################
     parser.add_argument("--pretrain_choice", default='ViT-B/16') # whether use pretrained model
+    parser.add_argument("--evidence_mode", choices=('none', 'off', 'a_only'), default='none')
+    parser.add_argument("--evidence_candidates", type=int, default=4)
+    parser.add_argument("--evidence_weight", type=float, default=0.1)
+    parser.add_argument("--evidence_temperature", type=float, default=0.07)
+    parser.add_argument("--evidence_margin", type=float, default=0.1)
     parser.add_argument("--temperature", type=float, default=0.02, help="initial temperature value, if 0, don't use temperature")
     parser.add_argument("--img_aug", default=False, action='store_true')
     parser.add_argument("--txt_aug", default=False, action='store_true')

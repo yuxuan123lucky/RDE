@@ -178,6 +178,11 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
     arguments = {}
     arguments["num_epoch"] = num_epoch
     arguments["iteration"] = 0
+    evidence_enabled = getattr(args, 'evidence_mode', 'none') == 'a_only'
+    if evidence_enabled:
+        arguments['evidence_config'] = {key: getattr(args, key) for key in (
+            'evidence_mode', 'evidence_candidates', 'evidence_weight',
+            'evidence_temperature', 'evidence_margin')}
 
     logger = logging.getLogger("RDE.train")
     logger.info('start training')
@@ -190,6 +195,9 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         "img_acc": AverageMeter(),
         "txt_acc": AverageMeter(),
     }
+    if evidence_enabled:
+        meters['evidence_a_loss'] = AverageMeter()
+        meters['evidence_valid_queries'] = AverageMeter()
 
     tb_writer = SummaryWriter(log_dir=args.output_dir)
 
@@ -224,11 +232,16 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
  
             ret = model(batch)
             total_loss = sum([v for k, v in ret.items() if "loss" in k])
+            if evidence_enabled and not torch.isfinite(total_loss).item():
+                raise FloatingPointError('nonfinite total loss in mechanism A training')
 
             batch_size = batch['images'].shape[0]
             meters['loss'].update(total_loss.item(), batch_size)
             meters['bge_loss'].update(ret.get('bge_loss', 0), batch_size)
             meters['tse_loss'].update(ret.get('tse_loss', 0), batch_size)
+            if evidence_enabled:
+                meters['evidence_a_loss'].update(ret['evidence_a_loss'].detach().item(), batch_size)
+                meters['evidence_valid_queries'].update(ret['evidence_valid_queries'].item(), batch_size)
          
             optimizer.zero_grad()
             total_loss.backward()
@@ -239,7 +252,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
                 info_str = f"Epoch[{epoch}] Iteration[{n_iter + 1}/{len(train_loader)}]"
                 # log loss and acc info
                 for k, v in meters.items():
-                    if v.avg > 0:
+                    if v.avg > 0 or (evidence_enabled and k.startswith('evidence_')):
                         info_str += f", {k}: {v.avg:.4f}"
                 info_str += f", Base Lr: {scheduler.get_lr()[0]:.2e}"
                 logger.info(info_str)
@@ -248,7 +261,7 @@ def do_train(start_epoch, args, model, train_loader, evaluator, optimizer,
         tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
         tb_writer.add_scalar('temperature', ret['temperature'], epoch)
         for k, v in meters.items():
-            if v.avg > 0:
+            if v.avg > 0 or (evidence_enabled and k.startswith('evidence_')):
                 tb_writer.add_scalar(k, v.avg, epoch)
 
         scheduler.step()
