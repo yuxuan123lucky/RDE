@@ -436,20 +436,28 @@ class RDEIntegrationTests(unittest.TestCase):
         captions[:, 0], captions[:, 1], captions[:, 2] = 1, torch.arange(2, 6, device="cuda"), 31
         batch = {"images": torch.randn(4, 3, 8, 8, device="cuda"), "caption_ids": captions,
                  "pids": torch.tensor([0, 0, 1, 2], device="cuda"), "label_hat": torch.ones(4, device="cuda")}
-        with patch.object(torch.backends.cudnn, "deterministic", True), \
-             patch.object(torch.backends.cudnn, "benchmark", False), \
-             patch.object(current, "local_evidence_loss", side_effect=AssertionError("off mode invoked A")), \
-             torch.no_grad():
-            old_ret, off_ret = old.train()(batch), off.train()(batch)
-            for key in old_ret:
-                self.assertTrue(torch.equal(old_ret[key], off_ret[key]), key)
-            old.eval()
-            off.eval()
-            for left, right in zip(old.compute_per_loss(batch), off.compute_per_loss(batch)):
-                self.assertTrue(torch.equal(left, right))
-            for method, value in (("encode_image", batch["images"]), ("encode_text", captions),
-                                  ("encode_image_tse", batch["images"]), ("encode_text_tse", captions)):
-                self.assertTrue(torch.equal(getattr(old, method)(value), getattr(off, method)(value)), method)
+        cudnn = torch.backends.cudnn
+        previous_flags = (cudnn.deterministic, cudnn.benchmark)
+        # cuDNN flags are ContextProp descriptors without __delete__; mock.patch
+        # cannot restore them via delattr. Restore their values explicitly,
+        # including when a strict numerical assertion fails.
+        try:
+            cudnn.deterministic = True
+            cudnn.benchmark = False
+            with patch.object(current, "local_evidence_loss", side_effect=AssertionError("off mode invoked A")), \
+                 torch.no_grad():
+                old_ret, off_ret = old.train()(batch), off.train()(batch)
+                for key in old_ret:
+                    self.assertTrue(torch.equal(old_ret[key], off_ret[key]), key)
+                old.eval()
+                off.eval()
+                for left, right in zip(old.compute_per_loss(batch), off.compute_per_loss(batch)):
+                    self.assertTrue(torch.equal(left, right))
+                for method, value in (("encode_image", batch["images"]), ("encode_text", captions),
+                                      ("encode_image_tse", batch["images"]), ("encode_text_tse", captions)):
+                    self.assertTrue(torch.equal(getattr(old, method)(value), getattr(off, method)(value)), method)
+        finally:
+            cudnn.deterministic, cudnn.benchmark = previous_flags
 
 
 if __name__ == "__main__":
